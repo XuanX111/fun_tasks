@@ -1,0 +1,134 @@
+import pandas as pd
+import numpy as np
+import copy
+import logging
+import matplotlib.pyplot as plt
+import math
+from stldecompose import decompose
+from outliers import smirnov_grubbs as grubbs
+from PyAstronomy import pyasl
+
+
+class OutlierDetection():
+
+    def __init__(self):
+       pass
+       
+    @staticmethod
+    def timestamp_data(self, df):
+        # Standardize the index column
+        df.reset_index(inplace=True)
+        df.timestamp = pd.to_datetime(df.timestamp, unit='s')
+        df.set_index(['timestamp'], inplace=True)
+        return df
+
+    def make_dataset(self, df):
+        # Get the time interval from the file index
+        df_copy = copy.deepcopy(df)
+        df_copy.reset_index(inplace=True)
+        delta_lst = (df_copy.timestamp - df_copy.timestamp.shift(1)). \
+            fillna(0)
+        delta_lst_sec = [time.seconds for time in delta_lst]
+        time_interval_sec = math.ceil(np.percentile(delta_lst_sec, 50))
+        interp_rate = str(time_interval_sec) + 'S'
+        self.logger.log(f'The time interval is {interp_rate}')
+        # Prepare the evenly sampled data in the unit of second
+        df_evenly_spaced = (df.resample(interp_rate)
+                            .mean()
+                            .interpolate('linear'))
+        return df_evenly_spaced, time_interval_sec
+
+    def stl_decompose(self, df, freq=24):
+        # For hourly observations with large daily cycles, period=24
+        stl = decompose(df, period=freq, lo_frac=0.8, lo_delta=1)
+        # Get the residual data
+        resid = stl.resid
+        # Second time decomposition (optional)
+        stl_sec = decompose(resid, period=freq)
+        resid_sec = stl_sec.resid
+        res_df = pd.Series(resid_sec.iloc[:, 0])
+        return res_df
+
+    def _stat(self, df_residual, df_evenly_spaced, alpha, window_size):
+        # Compute the optimal delete percentage based on the input data size
+        delete_percent = 0.15
+        # If the input data size is more than 30240, shrink down the delete percent accordingly
+        if window_size > 30240:
+            delete_percent = 0.15 / window_size * 30240
+
+        # Apply grubbs one-ways test
+        try:
+            gru_index = grubbs.max_test_indices(df_residual, alpha=alpha)
+
+        except ValueError:
+            gru_index = []
+            self.logger.log('Grubbs Test Value Error')
+
+        # Apply ESD test
+        try:
+            threshold_value = round(delete_percent * window_size)
+            esd_index = pyasl.generalizedESD(df_residual,
+                                             threshold_value,
+                                             0.1,
+                                             fullOutput=False)
+        except ZeroDivisionError:
+            esd_index = [[], []]
+            self.logger.log('ESD Test Fails')
+
+        # Apply polyResOutlier detect
+        try:
+            x = np.arange(len(df_residual))
+            _, poly_index = pyasl.polyResOutlier(x, df_residual.values,
+                                                 deg=1,
+                                                 stdlim=2.0,
+                                                 controlPlot=False)
+        except ValueError:
+            poly_index = []
+            self.logger.log('PolyRes Test Fails')
+
+        # Combine all the tests results together
+        combine_index = list(
+            set(gru_index + esd_index[1] + poly_index.tolist()))
+        time_lst = df_residual.iloc[combine_index].index
+        df_outlier = df_evenly_spaced.index.isin(time_lst)
+        df_rm_outlier = df_evenly_spaced[~df_outlier]
+
+        return df_rm_outlier
+
+    def rm_outlier(self, df_residual, df_evenly_spaced, alpha=0.1, window_size=1440):
+        aft_lst = []
+        aft_df = pd.DataFrame()
+
+        for i in range(0, len(df_residual), window_size):
+
+            if (i + window_size) >= len(df_residual):
+                internal = self._stat(df_residual.iloc[i:len(df_residual)],
+                                      df_evenly_spaced.iloc[i:len(df_residual)],
+                                      alpha, window_size)
+
+            else:
+                internal = self._stat(df_residual.iloc[i:i + window_size],
+                                      df_evenly_spaced.iloc[i:i + window_size],
+                                      alpha, window_size)
+
+            aft_lst.append(internal.to_dict())
+
+        for partial_df in aft_lst:
+            aft_df = aft_df.append(pd.DataFrame.from_dict(partial_df))
+        return aft_df
+
+    def plot_results(self, before_df, aft_df, tag):
+
+        plt.plot(before_df, 'mediumvioletred', aft_df, 'b')
+        plt.title(f'{tag}')
+        plt.savefig(f'{tag}_1.png')
+
+        plt.subplot(2, 1, 1)
+        plt.title(f'{tag} before')
+        plt.plot(before_df, 'mediumvioletred')
+
+        plt.subplot(2, 1, 2)
+        plt.plot(aft_df, 'b')
+        plt.title(f'{tag} after')
+        plt.savefig(f'{tag}_2.png')
+        plt.show()
